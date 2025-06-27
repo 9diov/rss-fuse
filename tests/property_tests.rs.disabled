@@ -1,0 +1,432 @@
+use proptest::prelude::*;
+use rss_fuse::feed::{parser::FeedParser, Article, ParsedArticle};
+use std::io::Cursor;
+
+// Property-based tests for feed parsing and processing
+// These tests generate random inputs to find edge cases
+
+proptest! {
+    #[test]
+    fn test_filename_generation_safety(
+        title in "[a-zA-Z0-9 ._-]{1,200}"
+    ) {
+        let parsed_article = ParsedArticle {
+            title: title.clone(),
+            link: "https://example.com/test".to_string(),
+            description: None,
+            content: None,
+            author: None,
+            published: None,
+            guid: None,
+            categories: vec![],
+        };
+        
+        let article = Article::new(parsed_article, "test-feed");
+        let filename = article.filename();
+        
+        // Filename should never be empty
+        prop_assert!(!filename.is_empty());
+        
+        // Filename should end with .txt
+        prop_assert!(filename.ends_with(".txt"));
+        
+        // Filename should not contain dangerous characters
+        prop_assert!(!filename.contains('/'));
+        prop_assert!(!filename.contains('\\'));
+        prop_assert!(!filename.contains(':'));
+        prop_assert!(!filename.contains('*'));
+        prop_assert!(!filename.contains('?'));
+        prop_assert!(!filename.contains('"'));
+        prop_assert!(!filename.contains('<'));
+        prop_assert!(!filename.contains('>'));
+        prop_assert!(!filename.contains('|'));
+        
+        // Filename should not contain control characters
+        for ch in filename.chars() {
+            prop_assert!(!ch.is_control());
+        }
+        
+        // Filename should be reasonable length (including .txt extension)
+        prop_assert!(filename.len() <= 104); // 100 chars + ".txt"
+    }
+    
+    #[test]
+    fn test_url_validation_robustness(
+        scheme in r"[a-zA-Z][a-zA-Z0-9+.-]*",
+        host in r"[a-zA-Z0-9.-]+",
+        path in r"/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]*"
+    ) {
+        let url = format!("{}://{}{}", scheme, host, path);
+        let parser = FeedParser::new();
+        let result = parser.validate_feed_url(&url);
+        
+        // Only http and https should be valid
+        if scheme == "http" || scheme == "https" {
+            // May be valid or invalid depending on host/path format
+            // But should not panic
+            let _ = result;
+        } else {
+            // Other schemes should be rejected
+            prop_assert!(result.is_err());
+        }
+    }
+    
+    #[test]
+    fn test_article_id_consistency(
+        title in r"[a-zA-Z0-9 .,!?-]+{1,100}",
+        link in r"https://[a-zA-Z0-9.-]+/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]*",
+        feed_name in r"[a-zA-Z0-9_-]+{1,50}"
+    ) {
+        let parsed_article = ParsedArticle {
+            title: title.clone(),
+            link: link.clone(),
+            description: None,
+            content: None,
+            author: None,
+            published: None,
+            guid: None, // No GUID, so ID will be generated from link hash
+            categories: vec![],
+        };
+        
+        // Create the same article multiple times
+        let article1 = Article::new(parsed_article.clone(), &feed_name);
+        let article2 = Article::new(parsed_article.clone(), &feed_name);
+        let article3 = Article::new(parsed_article, &feed_name);
+        
+        // IDs should be consistent
+        prop_assert_eq!(article1.id, article2.id);
+        prop_assert_eq!(article2.id, article3.id);
+        
+        // ID should contain the feed name
+        prop_assert!(article1.id.starts_with(&format!("{}:", feed_name)));
+    }
+    
+    #[test]
+    fn test_article_text_generation_safety(
+        title in r"[^\x00-\x08\x0B\x0C\x0E-\x1F\x7F]*{1,200}",
+        author in option::of(r"[^\x00-\x08\x0B\x0C\x0E-\x1F\x7F]*{1,100}"),
+        content in option::of(r"[^\x00-\x08\x0B\x0C\x0E-\x1F\x7F]*{1,1000}"),
+        tags in prop::collection::vec(r"[a-zA-Z0-9_-]+", 0..10)
+    ) {
+        let parsed_article = ParsedArticle {
+            title: title.clone(),
+            link: "https://example.com/test".to_string(),
+            description: None,
+            content: content.clone(),
+            author: author.clone(),
+            published: None,
+            guid: None,
+            categories: tags.clone(),
+        };
+        
+        let article = Article::new(parsed_article, "test-feed");
+        let text = article.to_text();
+        
+        // Text should never be empty
+        prop_assert!(!text.is_empty());
+        
+        // Text should contain the title
+        prop_assert!(text.contains(&title));
+        
+        // Text should contain author if provided
+        if let Some(ref author_name) = author {
+            if !author_name.is_empty() {
+                prop_assert!(text.contains(author_name));
+            }
+        }
+        
+        // Text should contain content if provided
+        if let Some(ref content_text) = content {
+            if !content_text.is_empty() {
+                prop_assert!(text.contains(content_text));
+            }
+        }
+        
+        // Text should contain tags if provided
+        if !tags.is_empty() {
+            for tag in &tags {
+                if !tag.is_empty() {
+                    prop_assert!(text.contains(tag));
+                }
+            }
+        }
+        
+        // Text should have proper structure
+        prop_assert!(text.contains("Title:"));
+        prop_assert!(text.contains("Link:"));
+        prop_assert!(text.contains("---"));
+    }
+    
+    #[test]
+    fn test_rss_parsing_with_random_valid_structure(
+        feed_title in "[a-zA-Z0-9 ._-]{1,100}",
+        feed_desc in "[a-zA-Z0-9 ._-]{1,200}",
+        article_count in 1usize..20,
+    ) {
+        let mut rss_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title>{}</title>
+        <description>{}</description>
+        <link>https://example.com</link>"#,
+            feed_title, feed_desc
+        );
+        
+        for i in 0..article_count {
+            rss_content.push_str(&format!(
+                r#"
+        <item>
+            <title>Article {}</title>
+            <link>https://example.com/article{}</link>
+            <description>Description for article {}</description>
+            <pubDate>Wed, 15 Mar 2024 10:{}:00 GMT</pubDate>
+        </item>"#,
+                i, i, i, i % 60
+            ));
+        }
+        
+        rss_content.push_str("\n    </channel>\n</rss>");
+        
+        let parser = FeedParser::new();
+        let cursor = Cursor::new(rss_content.as_bytes());
+        let result = parser.parse_feed(cursor);
+        
+        prop_assert!(result.is_ok());
+        
+        let feed = result.unwrap();
+        prop_assert_eq!(feed.title, feed_title);
+        prop_assert_eq!(feed.description, Some(feed_desc));
+        prop_assert_eq!(feed.articles.len(), article_count);
+    }
+    
+    #[test]
+    fn test_feed_parser_memory_safety_with_large_content(
+        content_size in 1usize..10000,
+        repeat_count in 1usize..100,
+    ) {
+        let large_content = "x".repeat(content_size);
+        let mut rss_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title>Memory Test Feed</title>
+        <description>Testing memory safety</description>
+        <link>https://example.com</link>"#
+        );
+        
+        for i in 0..repeat_count {
+            rss_content.push_str(&format!(
+                r#"
+        <item>
+            <title>Article {}</title>
+            <link>https://example.com/article{}</link>
+            <description><![CDATA[{}]]></description>
+        </item>"#,
+                i, i, large_content
+            ));
+        }
+        
+        rss_content.push_str("\n    </channel>\n</rss>");
+        
+        let parser = FeedParser::new();
+        let cursor = Cursor::new(rss_content.as_bytes());
+        let result = parser.parse_feed(cursor);
+        
+        // Should either succeed or fail gracefully (not panic)
+        match result {
+            Ok(feed) => {
+                prop_assert_eq!(feed.articles.len(), repeat_count);
+                // Verify we can access the content without issues
+                for article in &feed.articles {
+                    prop_assert!(article.description.is_some());
+                    if let Some(desc) = &article.description {
+                        prop_assert_eq!(desc.len(), content_size);
+                    }
+                }
+            }
+            Err(_) => {
+                // Parsing may fail with very large content, which is acceptable
+                // As long as it doesn't panic
+            }
+        }
+    }
+    
+    #[test]
+    fn test_html_entity_handling(
+        title_with_entities in r"[^<>&]*(&amp;|&lt;|&gt;|&quot;|&#39;)[^<>&]*",
+    ) {
+        let rss_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title>Entity Test Feed</title>
+        <description>Testing HTML entity handling</description>
+        <link>https://example.com</link>
+        <item>
+            <title>{}</title>
+            <link>https://example.com/article</link>
+            <description>Test article</description>
+        </item>
+    </channel>
+</rss>"#,
+            title_with_entities
+        );
+        
+        let parser = FeedParser::new();
+        let cursor = Cursor::new(rss_content.as_bytes());
+        let result = parser.parse_feed(cursor);
+        
+        prop_assert!(result.is_ok());
+        
+        let feed = result.unwrap();
+        prop_assert_eq!(feed.articles.len(), 1);
+        
+        // The parser should handle HTML entities correctly
+        let decoded_title = &feed.articles[0].title;
+        
+        // Entities should be decoded
+        if title_with_entities.contains("&amp;") {
+            prop_assert!(decoded_title.contains('&'));
+        }
+        if title_with_entities.contains("&lt;") {
+            prop_assert!(decoded_title.contains('<'));
+        }
+        if title_with_entities.contains("&gt;") {
+            prop_assert!(decoded_title.contains('>'));
+        }
+        if title_with_entities.contains("&quot;") {
+            prop_assert!(decoded_title.contains('"'));
+        }
+        if title_with_entities.contains("&#39;") {
+            prop_assert!(decoded_title.contains('\''));
+        }
+    }
+    
+    #[test]
+    fn test_article_deduplication_consistency(
+        base_title in r"[a-zA-Z0-9 ]+{5,50}",
+        base_link in r"https://[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+",
+        variation_count in 1usize..5,
+    ) {
+        // Create multiple articles with the same GUID but different content
+        let guid = "consistent-guid-123";
+        let feed_name = "test-feed";
+        
+        let mut articles = Vec::new();
+        
+        for i in 0..variation_count {
+            let parsed_article = ParsedArticle {
+                title: format!("{} - Variation {}", base_title, i),
+                link: format!("{}-{}", base_link, i),
+                description: Some(format!("Description variation {}", i)),
+                content: None,
+                author: None,
+                published: None,
+                guid: Some(guid.to_string()),
+                categories: vec![],
+            };
+            
+            let article = Article::new(parsed_article, feed_name);
+            articles.push(article);
+        }
+        
+        // All articles should have the same ID (based on GUID)
+        let first_id = &articles[0].id;
+        for article in &articles {
+            prop_assert_eq!(article.id, *first_id);
+        }
+        
+        // ID should be the GUID
+        prop_assert_eq!(*first_id, guid);
+    }
+}
+
+// Additional tests for edge cases with specific inputs
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+    
+    #[test]
+    fn test_empty_feed_elements() {
+        let rss_with_empty_elements = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title></title>
+        <description></description>
+        <link></link>
+        <item>
+            <title></title>
+            <link></link>
+            <description></description>
+            <author></author>
+        </item>
+    </channel>
+</rss>"#;
+        
+        let parser = FeedParser::new();
+        let cursor = Cursor::new(rss_with_empty_elements.as_bytes());
+        let result = parser.parse_feed(cursor);
+        
+        assert!(result.is_ok());
+        let feed = result.unwrap();
+        
+        // Parser should handle empty elements gracefully
+        assert_eq!(feed.title, "Untitled Feed"); // Default for empty title
+        assert_eq!(feed.articles.len(), 1);
+        assert_eq!(feed.articles[0].title, "Untitled"); // Default for empty title
+    }
+    
+    #[test]
+    fn test_very_long_urls() {
+        let long_url = format!("https://example.com/{}", "a".repeat(2000));
+        let parser = FeedParser::new();
+        
+        // Should handle very long URLs without panic
+        let result = parser.validate_feed_url(&long_url);
+        // Result may be Ok or Err, but should not panic
+        let _ = result;
+    }
+    
+    #[test]
+    fn test_unicode_in_all_fields() {
+        let unicode_rss = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title>Тест Üñîçødé 测试 🚀</title>
+        <description>Êxãmplé øƒ üñîçødé çhãráçtérs 中文测试 🎉</description>
+        <link>https://example.com/测试</link>
+        <item>
+            <title>Artíçlé wîth émøjîs 📰 äñd spéçîål çhãrs ñ</title>
+            <link>https://example.com/artíçlé/测试-🚀</link>
+            <description>Déscriptîøñ wîth üñîçødé 中文 🌟</description>
+            <author>Jøhñ Døé 李明 👨‍💻</author>
+            <category>测试</category>
+            <category>🏷️ tãg</category>
+        </item>
+    </channel>
+</rss>"#;
+        
+        let parser = FeedParser::new();
+        let cursor = Cursor::new(unicode_rss.as_bytes());
+        let result = parser.parse_feed(cursor);
+        
+        assert!(result.is_ok());
+        let feed = result.unwrap();
+        
+        // Unicode should be preserved
+        assert!(feed.title.contains("测试"));
+        assert!(feed.title.contains("🚀"));
+        
+        let article = Article::new(feed.articles[0].clone(), "unicode-test");
+        let filename = article.filename();
+        
+        // Filename should be generated safely even with Unicode
+        assert!(!filename.is_empty());
+        assert!(filename.ends_with(".txt"));
+        
+        let text = article.to_text();
+        assert!(text.contains("🚀"));
+        assert!(text.contains("测试"));
+    }
+}

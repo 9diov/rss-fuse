@@ -1,0 +1,152 @@
+[package]
+name = "rss-fuse"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A FUSE filesystem for RSS feeds, exposing them as directories and articles as files"
+license = "MIT"
+repository = "https://github.com/your-username/rss-fuse"
+homepage = "https://github.com/your-username/rss-fuse"
+documentation = "https://docs.rs/rss-fuse"
+keywords = ["rss", "fuse", "filesystem", "feeds", "tui"]
+categories = ["command-line-utilities", "filesystem", "web-programming"]
+readme = "README.md"
+rust-version = "1.70.0"
+
+[[bin]]
+name = "rss-fuse"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_real_feed"
+path = "bin/test_real_feed.rs"
+
+[[bin]]
+name = "test_fuse"
+path = "bin/test_fuse.rs"
+
+[[bin]]
+name = "test_integration"
+path = "bin/test_integration.rs"
+
+[[bin]]
+name = "test_storage"
+path = "bin/test_storage.rs"
+
+[dependencies]
+# FUSE filesystem bindings
+fuser = "0.14"
+libc = "0.2"
+
+# RSS/Atom feed parsing
+feed-rs = "1.3"
+rss = "2.0"
+
+# Async runtime and HTTP client
+tokio = { version = "1.34", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "gzip"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization and configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# Command-line interface
+clap = { version = "4.4", features = ["derive", "env"] }
+clap_complete = "4.4"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Date and time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL handling and validation
+url = "2.4"
+
+# Text processing and content extraction
+html2text = "0.6"
+html2md = "0.2"
+select = "0.6"
+regex = "1.10"
+pulldown-cmark = "0.9"
+
+# Caching and storage
+lru = "0.12"
+dashmap = "5.5"
+# rusqlite = { version = "0.29", features = ["chrono", "serde_json"] }
+
+# File system utilities
+dirs = "5.0"
+walkdir = "2.4"
+
+# Concurrency utilities
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+# System integration
+nix = "0.27"
+signal-hook = "0.3"
+
+# Hashing
+blake3 = "1.5"
+
+# Configuration and environment
+dotenvy = "0.15"
+
+# Temporary files
+tempfile = "3.8"
+
+# Performance monitoring (optional)
+metrics = { version = "0.21", optional = true }
+metrics-exporter-prometheus = { version = "0.12", optional = true }
+
+[dev-dependencies]
+assert_fs = "1.0"
+predicates = "3.0"
+wiremock = "0.5"
+test-log = "0.2"
+env_logger = "0.10"
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+blake3 = "1.5"
+
+[[bench]]
+name = "feed_benchmarks"
+harness = false
+
+[features]
+default = []
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+# vendored-sqlite = ["rusqlite/bundled"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.test]
+opt-level = 1
+
+# Optimize dependencies for faster builds in development
+[profile.dev.package."*"]
+opt-level = 2
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
