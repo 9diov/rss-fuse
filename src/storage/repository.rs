@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::feed::{Feed, Article};
 use crate::feed::fetcher::FeedFetcher;
 use crate::storage::cache::{CacheManager, CacheConfig};
+use crate::storage::persistent_cache::PersistentCacheConfig;
 use crate::storage::traits::{
     Storage, FeedRepository, ArticleRepository, RepositoryStats, 
     ArticleQuery, ArticleStats, MemoryStorage, StorageConfig
@@ -39,6 +40,29 @@ impl Repository {
             fetcher: FeedFetcher::new(),
             metrics: Arc::new(parking_lot::RwLock::new(RepositoryMetrics::default())),
         }
+    }
+
+    /// Create repository with persistent cache
+    pub fn with_persistent_cache(storage: Arc<dyn Storage>, cache_config: CacheConfig, 
+                                persistent_config: PersistentCacheConfig) -> Result<Self> {
+        let cache = CacheManager::with_persistence(cache_config, persistent_config)?;
+        
+        let mut repo = Self {
+            storage,
+            cache,
+            fetcher: FeedFetcher::new(),
+            metrics: Arc::new(parking_lot::RwLock::new(RepositoryMetrics::default())),
+        };
+
+        // Enable auto-save for persistent cache
+        repo.cache.enable_auto_save();
+
+        Ok(repo)
+    }
+
+    /// Save cache to disk manually
+    pub fn save_cache(&self) -> Result<()> {
+        self.cache.save_to_disk()
     }
 
     pub fn with_memory_storage() -> Self {
@@ -196,8 +220,52 @@ impl FeedRepository for Repository {
         // Store the refreshed feed
         self.store_feed_in_cache_and_storage(feed.clone()).await?;
         
+        // Save to disk immediately after refresh
+        if let Err(e) = self.save_cache() {
+            tracing::warn!("Failed to save cache after feed refresh: {}", e);
+        } else {
+            tracing::debug!("Cache saved to disk after refreshing feed: {}", name);
+        }
+        
         self.record_operation_time(start.elapsed());
         Ok(feed)
+    }
+
+    /// Load feed with cache-first strategy: return cached content immediately,
+    /// then refresh in background and return fresh content if available
+    async fn load_feed_cache_first(&self, name: &str, url: &str) -> Result<Option<Feed>> {
+        let start = Instant::now();
+        
+        // First, try to get cached/stored content immediately
+        let cached_feed = self.get_feed_from_cache_or_storage(name).await?;
+        
+        if let Some(ref feed) = cached_feed {
+            self.record_operation_time(start.elapsed());
+            return Ok(Some(feed.clone()));
+        }
+        
+        // If no cached content, return None (caller can show loading placeholder)
+        // Background refresh will be triggered separately
+        self.record_operation_time(start.elapsed());
+        Ok(None)
+    }
+
+    /// Refresh feed in background and update cache/storage
+    async fn refresh_feed_background(&self, name: &str, url: &str) -> Result<Option<Feed>> {
+        let start = Instant::now();
+        
+        match self.refresh_feed(name, url).await {
+            Ok(feed) => {
+                self.record_operation_time(start.elapsed());
+                Ok(Some(feed))
+            }
+            Err(e) => {
+                // Log error but don't fail - cached content is still valid
+                tracing::warn!("Background refresh failed for feed {}: {}", name, e);
+                self.record_operation_time(start.elapsed());
+                Ok(None)
+            }
+        }
     }
 
     async fn get_stats(&self) -> Result<RepositoryStats> {
@@ -483,6 +551,13 @@ impl RepositoryFactory {
     pub fn with_config(storage_config: StorageConfig, cache_config: CacheConfig) -> Repository {
         let storage = Arc::new(MemoryStorage::new(storage_config));
         Repository::new(storage, cache_config)
+    }
+
+    /// Create repository with persistent cache
+    pub fn with_persistent_cache(storage_config: StorageConfig, cache_config: CacheConfig,
+                                persistent_config: PersistentCacheConfig) -> Result<Repository> {
+        let storage = Arc::new(MemoryStorage::new(storage_config));
+        Repository::with_persistent_cache(storage, cache_config, persistent_config)
     }
     
     pub async fn create_with_cleanup_task(

@@ -307,5 +307,5 @@ fn default_log_file() -> String { "logs/rss-fuse.log".to_string() }
 // File manager defaults
 fn default_file_manager() -> String { "ranger".to_string() }
 fn default_terminal_command() -> String { "xterm".to_string() }
-fn default_launch_delay() -> u64 { 2 }
+fn default_launch_delay() -> u64 { 1 }
 fn default_auto_detect() -> bool { true }

@@ -17,7 +17,11 @@
       "WebFetch(domain:libfuse.github.io)",
       "Bash(pkill:*)",
       "Bash(fusermount:*)",
-      "Bash(true)"
+      "Bash(true)",
+      "Bash(./target/release/rss-fuse unmount /tmp/rss-test)",
+      "Bash(rm:*)",
+      "Bash(time:*)",
+      "Bash(./target/release/rss-fuse:*)"
     ],
     "deny": []
   }

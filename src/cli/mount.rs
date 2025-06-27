@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::io::Write;
 use tokio::signal;
 use tracing::{info, warn, error, debug};
 
 use crate::config::Config;
-use crate::storage::{Repository, RepositoryFactory, CacheConfig, FeedRepository};
+use crate::storage::{Repository, RepositoryFactory, CacheConfig, PersistentCacheConfig, FeedRepository};
 use crate::fuse::{FuseOperations, MountOptions};
 use crate::file_manager::FileManagerLauncher;
 use crate::error::{Error, Result};
@@ -21,8 +22,11 @@ pub async fn mount(
     config_path: Option<PathBuf>,
 ) -> Result<()> {
     info!("Mounting RSS-FUSE at: {}", mount_point.display());
+    let mount_start = std::time::Instant::now();
     
     // Load configuration
+    print!("⚡ Initializing RSS-FUSE... ");
+    std::io::stdout().flush().unwrap();
     let config_file = get_config_file(config_path)?;
     let config = if config_file.exists() {
         Config::load(&config_file)?
@@ -31,6 +35,7 @@ pub async fn mount(
             "Configuration file not found. Run 'rss-fuse init' first.".to_string()
         ));
     };
+    println!("✅ ({:.0}ms)", mount_start.elapsed().as_millis());
     
     if config.feeds.is_empty() {
         warn!("No feeds configured. The filesystem will be empty.");
@@ -45,13 +50,26 @@ pub async fn mount(
         max_entries: 1000,
         default_ttl: Duration::from_secs(config.settings.cache_duration),
         cleanup_interval: Duration::from_secs(300),
-        max_memory_mb: 100,
+        max_memory_mb: config.cache.max_size_mb as usize,
+    };
+
+    // Setup persistent cache configuration
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/tmp".into()))
+        .join("rss-fuse");
+    
+    let persistent_config = PersistentCacheConfig {
+        cache_dir,
+        max_age_days: 7, // Keep cache for 1 week
+        max_size_mb: config.cache.max_size_mb as u64,
+        enable_compression: true,
     };
     
-    let repo = RepositoryFactory::with_config(
+    let repo = Arc::new(RepositoryFactory::with_persistent_cache(
         crate::storage::StorageConfig::default(),
         cache_config,
-    );
+        persistent_config,
+    ).map_err(|e| Error::Storage(format!("Failed to create repository with persistent cache: {}", e)))?);
     
     // Create FUSE operations first
     let fuse_ops = FuseOperations::new();
@@ -76,8 +94,11 @@ pub async fn mount(
     }
     
     // Check mount point validity and handle stale mounts
+    print!("🔍 Validating mount point... ");
+    std::io::stdout().flush().unwrap();
     match fuse_ops.validate_mount_point(&mount_point) {
         Ok(_) => {
+            println!("✅ ({:.0}ms)", mount_start.elapsed().as_millis());
             info!("Mount point validation passed: {}", mount_point.display());
         },
         Err(Error::AlreadyExists(_)) => {
@@ -152,71 +173,137 @@ pub async fn mount(
     println!("   📁 Mount point: {}", mount_point.display());
     println!("   🔧 Options: {}", format_mount_options(&mount_options));
     
-    // Start initial feed loading task (runs once immediately after mount)
-    let initial_repo = repo.clone();
-    let initial_config = config.clone();
-    let initial_fuse = Arc::clone(&fuse_ops.filesystem);
+    // Start cache-first loading task
+    let cache_repo = repo.clone();
+    let cache_config = config.clone();
+    let cache_fuse = Arc::clone(&fuse_ops.filesystem);
     
     tokio::spawn(async move {
-        info!("Starting initial feed loading in background");
+        info!("Starting cache-first feed loading");
         
-        for (name, url) in &initial_config.feeds {
-            debug!("Loading feed: {} from {}", name, url);
+        // Phase 1: Load cached content immediately
+        for (name, url) in &cache_config.feeds {
+            debug!("Checking cache for feed: {}", name);
             
-            match initial_repo.refresh_feed(name, url).await {
-                Ok(feed) => {
-                    info!("Successfully loaded feed: {} ({} articles)", name, feed.articles.len());
+            match cache_repo.load_feed_cache_first(name, url).await {
+                Ok(Some(feed)) => {
+                    info!("Found cached feed: {} ({} articles, age: {:?})", 
+                          name, feed.articles.len(), 
+                          feed.last_updated.map(|t| chrono::Utc::now().signed_duration_since(t)));
                     
-                    // Replace placeholder with actual feed content
-                    if let Err(e) = initial_fuse.add_feed(feed) {
-                        error!("Failed to add loaded feed {} to filesystem: {}", name, e);
+                    // Add cached content immediately
+                    if let Err(e) = cache_fuse.add_feed_from_cache(feed, true) {
+                        error!("Failed to add cached feed {} to filesystem: {}", name, e);
                     }
                 },
+                Ok(None) => {
+                    debug!("No cached content for feed: {}", name);
+                    // Keep loading placeholder - background refresh will update it
+                },
                 Err(e) => {
-                    error!("Failed to load feed {}: {}", name, e);
-                    
-                    // Update placeholder with error information
-                    if let Err(err) = initial_fuse.add_error_placeholder(name, &e.to_string()) {
-                        error!("Failed to add error placeholder for {}: {}", name, err);
-                    }
+                    warn!("Failed to load cached feed {}: {}", name, e);
                 }
             }
         }
         
-        info!("Initial feed loading completed");
+        info!("Cache loading phase completed");
     });
     
-    // Start periodic refresh task
+    // Start background refresh task (runs immediately for fresh content)
     let refresh_repo = repo.clone();
     let refresh_config = config.clone();
     let refresh_fuse = Arc::clone(&fuse_ops.filesystem);
     
     tokio::spawn(async move {
-        // Wait for initial loading to complete before starting periodic refresh
+        info!("Starting background feed refresh");
+        
+        // Small delay to let cache loading complete first
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        for (name, url) in &refresh_config.feeds {
+            debug!("Background refreshing feed: {} from {}", name, url);
+            
+            match refresh_repo.refresh_feed_background(name, url).await {
+                Ok(Some(feed)) => {
+                    info!("Successfully refreshed feed: {} ({} articles)", name, feed.articles.len());
+                    
+                    // Update filesystem with fresh content
+                    if let Err(e) = refresh_fuse.add_feed_from_cache(feed, false) {
+                        error!("Failed to update refreshed feed {} in filesystem: {}", name, e);
+                    }
+                },
+                Ok(None) => {
+                    debug!("Background refresh failed for feed: {} (cached content remains)", name);
+                },
+                Err(e) => {
+                    error!("Background refresh error for feed {}: {}", name, e);
+                    
+                    // Only add error placeholder if we don't have cached content
+                    if refresh_repo.get_feed(name).await.unwrap_or(None).is_none() {
+                        if let Err(err) = refresh_fuse.add_error_placeholder(name, &e.to_string()) {
+                            error!("Failed to add error placeholder for {}: {}", name, err);
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("Background refresh completed");
+    });
+    
+    // Start periodic refresh task  
+    let periodic_repo = repo.clone();
+    let periodic_config = config.clone();
+    let periodic_fuse = Arc::clone(&fuse_ops.filesystem);
+    
+    tokio::spawn(async move {
+        // Wait for initial loading and background refresh to complete
         tokio::time::sleep(Duration::from_secs(30)).await;
         
-        let interval_secs = refresh_config.settings.refresh_interval;
+        let interval_secs = periodic_config.settings.refresh_interval;
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         
         loop {
             interval.tick().await;
-            debug!("Running periodic feed refresh");
+            info!("Running periodic feed refresh (interval: {}s)", interval_secs);
             
-            for (name, url) in &refresh_config.feeds {
-                match refresh_repo.refresh_feed(name, url).await {
-                    Ok(feed) => {
-                        debug!("Refreshed feed: {} ({} articles)", name, feed.articles.len());
-                        
-                        // Update FUSE filesystem
-                        if let Err(e) = refresh_fuse.add_feed(feed) {
-                            warn!("Failed to update feed {} in filesystem: {}", name, e);
+            // Create a vector of tasks for parallel refresh
+            let mut refresh_tasks = Vec::new();
+            
+            for (name, url) in &periodic_config.feeds {
+                let repo = periodic_repo.clone();
+                let fuse = Arc::clone(&periodic_fuse);
+                let feed_name = name.clone();
+                let feed_url = url.clone();
+                
+                let task = tokio::spawn(async move {
+                    match repo.refresh_feed_background(&feed_name, &feed_url).await {
+                        Ok(Some(feed)) => {
+                            debug!("Periodic refresh: {} ({} articles)", feed_name, feed.articles.len());
+                            
+                            // Update FUSE filesystem with fresh content
+                            if let Err(e) = fuse.add_feed_from_cache(feed, false) {
+                                warn!("Failed to update refreshed feed {} in filesystem: {}", feed_name, e);
+                            }
+                        },
+                        Ok(None) => {
+                            debug!("Periodic refresh failed for {}, keeping cached content", feed_name);
+                        },
+                        Err(e) => {
+                            warn!("Periodic refresh error for {}: {}", feed_name, e);
                         }
-                    },
-                    Err(e) => {
-                        warn!("Failed to refresh feed {}: {}", name, e);
                     }
-                }
+                });
+                
+                refresh_tasks.push(task);
             }
+            
+            // Wait for all refresh tasks to complete
+            for task in refresh_tasks {
+                let _ = task.await;
+            }
+            
+            debug!("Periodic refresh cycle completed");
         }
     });
     
@@ -235,14 +322,20 @@ pub async fn mount(
     let file_manager_launcher = FileManagerLauncher::new(file_manager_config);
 
     // Mount the filesystem
-    if foreground {
-        mount_foreground(fuse_ops, mount_point, mount_options, file_manager_launcher).await
+    let result = if foreground {
+        mount_foreground(fuse_ops, mount_point.clone(), mount_options, file_manager_launcher, repo.clone()).await
     } else if daemon {
-        mount_daemon(fuse_ops, mount_point, mount_options, file_manager_launcher).await
+        mount_daemon(fuse_ops, mount_point.clone(), mount_options, file_manager_launcher, repo.clone()).await
     } else {
         // Default to foreground mode for now
-        mount_foreground(fuse_ops, mount_point, mount_options, file_manager_launcher).await
+        mount_foreground(fuse_ops, mount_point.clone(), mount_options, file_manager_launcher, repo.clone()).await
+    };
+
+    if result.is_ok() {
+        println!("⚡ Total startup time: {:.0}ms", mount_start.elapsed().as_millis());
     }
+
+    result
 }
 
 /// Mount filesystem in foreground mode
@@ -251,6 +344,7 @@ async fn mount_foreground(
     mount_point: PathBuf,
     mount_options: MountOptions,
     file_manager_launcher: FileManagerLauncher,
+    repo: Arc<Repository>,
 ) -> Result<()> {
     println!("\n🚀 Starting RSS-FUSE filesystem...");
     println!("   Mode: Foreground");
@@ -258,15 +352,17 @@ async fn mount_foreground(
     println!("   Press Ctrl+C to unmount and exit");
     println!("");
     
-    // Simulate mounting (in a real implementation, this would use fuser::mount)
+    print!("🔗 Mounting filesystem... ");
+    std::io::stdout().flush().unwrap();
+    let mount_time = std::time::Instant::now();
     info!("Mounting filesystem at {}", mount_point.display());
     
     // For now, we'll simulate the mount and wait for signal
     match fuse_ops.mount(&mount_point, mount_options) {
         Ok(_) => {
-            println!("✅ Filesystem mounted successfully!");
-            println!("   You can now access your RSS feeds at: {}", mount_point.display());
-            println!("   Use 'ls {}' to see your feeds", mount_point.display());
+            println!("✅ ({:.0}ms)", mount_time.elapsed().as_millis());
+            println!("📂 Filesystem ready at: {}", mount_point.display());
+            println!("   RSS feeds are loading in the background...");
             println!("");
             
             // Launch file manager if configured
@@ -282,6 +378,14 @@ async fn mount_foreground(
             wait_for_shutdown().await;
             
             println!("\n🔄 Shutting down...");
+            
+            // Save cache before unmounting
+            println!("💾 Saving cache to disk...");
+            if let Err(e) = repo.save_cache() {
+                warn!("Failed to save cache on shutdown: {}", e);
+            } else {
+                println!("✅ Cache saved successfully");
+            }
             
             // Unmount filesystem
             if let Err(e) = fuse_ops.unmount(&mount_point, false) {
@@ -305,16 +409,21 @@ async fn mount_daemon(
     mount_point: PathBuf,
     mount_options: MountOptions,
     file_manager_launcher: FileManagerLauncher,
+    _repo: Arc<Repository>,
 ) -> Result<()> {
     println!("\n🚀 Starting RSS-FUSE daemon...");
     println!("   Mode: Background (daemon)");
     println!("   Mount point: {}", mount_point.display());
     
+    print!("🔗 Mounting filesystem... ");
+    std::io::stdout().flush().unwrap();
+    let mount_time = std::time::Instant::now();
     // In a real implementation, this would fork and daemonize
     // For now, we'll just mount and detach
     match fuse_ops.mount(&mount_point, mount_options) {
         Ok(_) => {
-            println!("✅ Daemon started successfully!");
+            println!("✅ ({:.0}ms)", mount_time.elapsed().as_millis());
+            println!("📂 Daemon started successfully!");
             println!("   Filesystem mounted at: {}", mount_point.display());
             println!("   Use 'rss-fuse unmount {}' to stop", mount_point.display());
             

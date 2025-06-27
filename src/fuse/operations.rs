@@ -92,8 +92,8 @@ impl FuseOperations {
             }
         });
         
-        // Give the mount a moment to establish
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Give the mount a moment to establish (reduced for faster startup)
+        std::thread::sleep(std::time::Duration::from_millis(50));
         
         info!("Filesystem mounted successfully at {}", mount_point.display());
         
@@ -400,7 +400,7 @@ impl FuseOperations {
             None => return false,
         };
 
-        // Check /proc/mounts on Linux
+        // Check /proc/mounts on Linux (fast system call)
         if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
             for line in mounts.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -408,16 +408,15 @@ impl FuseOperations {
                     return true;
                 }
             }
+            // /proc/mounts was readable but mount point not found
+            return false;
         }
 
-        // Check with mount command as fallback
+        // Only use mount command as fallback if /proc/mounts is unavailable
+        // (avoid redundant system call for performance)
         if let Ok(output) = Command::new("mount").output() {
             let mounts = String::from_utf8_lossy(&output.stdout);
-            for line in mounts.lines() {
-                if line.contains(mount_point_str) {
-                    return true;
-                }
-            }
+            return mounts.lines().any(|line| line.contains(mount_point_str));
         }
 
         false

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use fuser::FileType;
 use crate::feed::Article;
@@ -26,6 +27,9 @@ pub struct VNode {
     pub file_type: FileType,
     pub size: u64,
     pub children: Vec<u64>, // Child inode numbers
+    pub created_time: SystemTime,
+    pub modified_time: SystemTime,
+    pub accessed_time: SystemTime,
 }
 
 impl VNode {
@@ -45,6 +49,7 @@ impl VNode {
             NodeType::ConfigFile => (FileType::RegularFile, 0), // Will be computed when needed
         };
 
+        let now = SystemTime::now();
         Self {
             ino,
             parent_ino,
@@ -53,17 +58,39 @@ impl VNode {
             file_type,
             size,
             children: Vec::new(),
+            created_time: now,
+            modified_time: now,
+            accessed_time: now,
         }
     }
 
     pub fn add_child(&mut self, child_ino: u64) {
         if !self.children.contains(&child_ino) {
             self.children.push(child_ino);
+            self.touch_modified();
         }
     }
 
     pub fn remove_child(&mut self, child_ino: u64) {
-        self.children.retain(|&ino| ino != child_ino);
+        if self.children.contains(&child_ino) {
+            self.children.retain(|&ino| ino != child_ino);
+            self.touch_modified();
+        }
+    }
+
+    pub fn touch_accessed(&mut self) {
+        self.accessed_time = SystemTime::now();
+    }
+
+    pub fn touch_modified(&mut self) {
+        let now = SystemTime::now();
+        self.modified_time = now;
+        self.accessed_time = now;
+    }
+
+    pub fn update_content(&mut self, new_size: u64) {
+        self.size = new_size;
+        self.touch_modified();
     }
 
     pub fn is_directory(&self) -> bool {
@@ -147,6 +174,9 @@ impl InodeManager {
         // Add to name lookup
         self.name_to_ino.write().insert((parent_ino, name), ino);
 
+        // Touch parent directory to update its modification time
+        self.touch_directory_and_parents(parent_ino);
+
         Ok(ino)
     }
 
@@ -157,6 +187,8 @@ impl InodeManager {
 
         let node = self.get_node(ino)
             .ok_or("Node not found")?;
+
+        let parent_ino = node.parent_ino;
 
         // Remove from parent's children
         {
@@ -169,6 +201,9 @@ impl InodeManager {
 
         // Remove from name lookup
         self.name_to_ino.write().remove(&(node.parent_ino, node.name));
+
+        // Touch parent directory to update its modification time
+        self.touch_directory_and_parents(parent_ino);
 
         Ok(())
     }
@@ -187,7 +222,42 @@ impl InodeManager {
 
     pub fn update_node_size(&self, ino: u64, size: u64) {
         if let Some(node) = self.nodes.write().get_mut(&ino) {
-            node.size = size;
+            node.update_content(size);
+        }
+    }
+
+    pub fn touch_node_accessed(&self, ino: u64) {
+        if let Some(node) = self.nodes.write().get_mut(&ino) {
+            node.touch_accessed();
+        }
+    }
+
+    pub fn touch_node_modified(&self, ino: u64) {
+        if let Some(node) = self.nodes.write().get_mut(&ino) {
+            node.touch_modified();
+        }
+    }
+
+    pub fn touch_directory_and_parents(&self, ino: u64) {
+        let mut current_ino = ino;
+        loop {
+            let parent_ino = {
+                let mut nodes = self.nodes.write();
+                if let Some(node) = nodes.get_mut(&current_ino) {
+                    if node.is_directory() {
+                        node.touch_modified();
+                    }
+                    node.parent_ino
+                } else {
+                    break;
+                }
+            };
+
+            if current_ino == parent_ino || parent_ino == 1 {
+                // Reached root or self-referencing node
+                break;
+            }
+            current_ino = parent_ino;
         }
     }
 

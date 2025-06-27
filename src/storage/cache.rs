@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 
 use crate::feed::{Feed, Article};
 use crate::error::{Error, Result};
+use crate::storage::persistent_cache::{PersistentCache, PersistentCacheConfig};
 
 /// Cache entry with expiration tracking
 #[derive(Debug, Clone)]
@@ -377,6 +378,7 @@ impl FeedCache {
 pub struct CacheManager {
     pub articles: ArticleCache,
     pub feeds: FeedCache,
+    persistent_cache: Option<Arc<PersistentCache>>,
 }
 
 impl CacheManager {
@@ -394,6 +396,110 @@ impl CacheManager {
         Self {
             articles: ArticleCache::new(article_config),
             feeds: FeedCache::new(feed_config),
+            persistent_cache: None,
+        }
+    }
+
+    /// Create a new cache manager with persistent storage
+    pub fn with_persistence(config: CacheConfig, persistent_config: PersistentCacheConfig) -> Result<Self> {
+        let article_config = CacheConfig {
+            max_entries: config.max_entries,
+            ..config.clone()
+        };
+
+        let feed_config = CacheConfig {
+            max_entries: config.max_entries / 10, // Fewer feeds than articles
+            ..config
+        };
+
+        let persistent_cache = PersistentCache::new(persistent_config)?;
+
+        let mut manager = Self {
+            articles: ArticleCache::new(article_config),
+            feeds: FeedCache::new(feed_config),
+            persistent_cache: Some(Arc::new(persistent_cache)),
+        };
+
+        // Load existing cache from disk
+        manager.load_from_disk()?;
+
+        Ok(manager)
+    }
+
+    /// Load cache data from disk
+    pub fn load_from_disk(&mut self) -> Result<()> {
+        if let Some(ref persistent_cache) = self.persistent_cache {
+            if let Some(cache_data) = persistent_cache.load()? {
+                tracing::info!("Loading persistent cache: {} feeds, {} articles", 
+                              cache_data.feeds.len(), cache_data.articles.len());
+
+                // Load feeds into cache
+                for (feed_name, entry_data) in cache_data.feeds {
+                    let cache_entry: CacheEntry<Feed> = entry_data.into();
+                    if !cache_entry.is_expired() {
+                        let _ = self.feeds.put(feed_name, cache_entry.data);
+                    }
+                }
+
+                // Load articles into cache
+                for (article_id, entry_data) in cache_data.articles {
+                    let cache_entry: CacheEntry<Article> = entry_data.into();
+                    if !cache_entry.is_expired() {
+                        let _ = self.articles.put(article_id, Arc::new(cache_entry.data));
+                    }
+                }
+
+                tracing::info!("Loaded persistent cache successfully");
+            } else {
+                tracing::debug!("No persistent cache found or cache expired");
+            }
+        }
+        Ok(())
+    }
+
+    /// Save cache data to disk
+    pub fn save_to_disk(&self) -> Result<()> {
+        if let Some(ref persistent_cache) = self.persistent_cache {
+            // Get current cache contents
+            let feeds = {
+                let feeds = self.feeds.feeds.read();
+                feeds.clone()
+            };
+
+            let articles = {
+                let articles = self.articles.cache.read();
+                // Convert LruCache to HashMap for persistence
+                let mut article_map = HashMap::new();
+                for (k, v) in articles.iter() {
+                    article_map.insert(k.clone(), v.clone());
+                }
+                article_map
+            };
+
+            tracing::info!("Saving cache to disk: {} feeds, {} articles", 
+                         feeds.len(), articles.len());
+            persistent_cache.save(&feeds, &articles)?;
+            tracing::info!("Cache saved successfully to: {}", 
+                         persistent_cache.cache_path().display());
+        } else {
+            tracing::warn!("No persistent cache configured - cannot save to disk");
+        }
+        Ok(())
+    }
+
+    /// Enable automatic cache persistence
+    pub fn enable_auto_save(&self) {
+        if self.persistent_cache.is_some() {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // Save every 5 minutes
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = manager.save_to_disk() {
+                        tracing::warn!("Failed to auto-save cache: {}", e);
+                    }
+                }
+            });
         }
     }
 

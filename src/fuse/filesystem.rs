@@ -12,7 +12,7 @@ use libc::{ENOENT, ENOTDIR, EISDIR, EINVAL};
 use parking_lot::RwLock;
 use tracing::{debug, warn, error};
 
-use crate::fuse::create_file_attr;
+use crate::fuse::{create_file_attr, create_file_attr_with_times};
 use crate::fuse::inode::{InodeManager, NodeType};
 use crate::feed::{Feed, Article};
 use crate::error::Result;
@@ -108,6 +108,9 @@ impl RssFuseFilesystem {
             warn!("Failed to create loading placeholder for {}: {}", feed_name, e);
         }
 
+        // Update directory timestamps to show loading state change
+        self.refresh_directory_timestamps(feed_name);
+
         Ok(())
     }
 
@@ -171,6 +174,9 @@ impl RssFuseFilesystem {
             warn!("Failed to create error placeholder for {}: {}", feed_name, e);
         }
 
+        // Update directory timestamps to show error state change
+        self.refresh_directory_timestamps(feed_name);
+
         Ok(())
     }
 
@@ -197,7 +203,68 @@ impl RssFuseFilesystem {
         }
 
         // Store feed data
-        self.feeds.write().insert(feed_name, feed);
+        self.feeds.write().insert(feed_name.clone(), feed);
+        
+        // Update directory timestamps to trigger file manager refresh
+        self.refresh_directory_timestamps(&feed_name);
+        
+        Ok(())
+    }
+
+    /// Add or update feed content from cache (first load or background refresh)
+    /// This method is optimized for cache-first loading scenarios
+    pub fn add_feed_from_cache(&self, feed: Feed, is_from_cache: bool) -> Result<()> {
+        let feed_name = feed.name.clone();
+        
+        // Update loading status based on source
+        let status = if is_from_cache {
+            FeedLoadingStatus::Loaded // Will be updated when fresh content arrives
+        } else {
+            FeedLoadingStatus::Loaded
+        };
+        self.loading_status.write().insert(feed_name.clone(), status);
+        
+        // Check if we already have content for this feed
+        let has_existing_content = {
+            let feeds = self.feeds.read();
+            feeds.contains_key(&feed_name)
+        };
+        
+        // If this is fresh content updating cached content, be more selective about updates
+        if !is_from_cache && has_existing_content {
+            // This is a background refresh update - compare article counts
+            let existing_article_count = {
+                let feeds = self.feeds.read();
+                feeds.get(&feed_name).map(|f| f.articles.len()).unwrap_or(0)
+            };
+            
+            debug!("Updating {} with fresh content: {} -> {} articles", 
+                   feed_name, existing_article_count, feed.articles.len());
+        } else if is_from_cache {
+            debug!("Loading {} from cache: {} articles", feed_name, feed.articles.len());
+        }
+        
+        // Remove existing content and add new content
+        self.remove_feed(&feed_name)?;
+        
+        // Create feed directory
+        if let Err(e) = self.inode_manager.create_feed_directory(&feed_name) {
+            warn!("Failed to create feed directory for {}: {}", feed_name, e);
+        }
+
+        // Add articles
+        for article in &feed.articles {
+            let article_arc = Arc::new(article.clone());
+            if let Err(e) = self.inode_manager.create_article_file(&feed_name, article_arc) {
+                warn!("Failed to create article file for {}: {}", article.title, e);
+            }
+        }
+
+        // Store feed data
+        self.feeds.write().insert(feed_name.clone(), feed);
+        
+        // Update directory timestamps to trigger file manager refresh
+        self.refresh_directory_timestamps(&feed_name);
         
         Ok(())
     }
@@ -253,6 +320,28 @@ impl RssFuseFilesystem {
         self.loading_status.read().get(feed_name).cloned()
     }
 
+    pub fn refresh_directory_timestamps(&self, feed_name: &str) {
+        // Update the feed directory's modification time
+        if let Some(feed_node) = self.inode_manager.get_node_by_name(FUSE_ROOT_ID, feed_name) {
+            self.inode_manager.touch_directory_and_parents(feed_node.ino);
+        }
+        
+        // Also update root directory timestamp to ensure top-level changes are detected
+        self.inode_manager.touch_node_modified(FUSE_ROOT_ID);
+    }
+
+    pub fn refresh_all_directory_timestamps(&self) {
+        // Update all feed directories
+        let root_children = self.inode_manager.list_children(FUSE_ROOT_ID);
+        for child in root_children {
+            if child.is_directory() {
+                if let NodeType::FeedDirectory(feed_name) = &child.node_type {
+                    self.refresh_directory_timestamps(feed_name);
+                }
+            }
+        }
+    }
+
     /// Get TTL based on content state - dynamic content gets shorter cache times
     pub fn get_ttl_for_node(&self, node: &crate::fuse::inode::VNode) -> Duration {
         use std::time::Duration;
@@ -297,7 +386,16 @@ impl RssFuseFilesystem {
             _ => 0o644,
         };
 
-        create_file_attr(node.ino, node.size, kind, perm)
+        create_file_attr_with_times(
+            node.ino, 
+            node.size, 
+            kind, 
+            perm,
+            node.accessed_time,
+            node.modified_time,
+            node.created_time,
+            node.created_time,
+        )
     }
 
     fn lookup_node(&self, parent: u64, name: &OsStr) -> Option<crate::fuse::inode::VNode> {

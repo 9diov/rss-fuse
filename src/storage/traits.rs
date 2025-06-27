@@ -99,6 +99,12 @@ pub trait FeedRepository: Send + Sync {
     /// Refresh feed from source and update storage
     async fn refresh_feed(&self, name: &str, url: &str) -> Result<Feed>;
     
+    /// Load feed with cache-first strategy (returns immediately from cache)
+    async fn load_feed_cache_first(&self, name: &str, url: &str) -> Result<Option<Feed>>;
+    
+    /// Refresh feed in background and update cache/storage
+    async fn refresh_feed_background(&self, name: &str, url: &str) -> Result<Option<Feed>>;
+    
     /// Get repository statistics
     async fn get_stats(&self) -> Result<RepositoryStats>;
 }
