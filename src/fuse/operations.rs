@@ -125,57 +125,272 @@ impl FuseOperations {
         let mount_point_str = mount_point.to_str()
             .ok_or_else(|| Error::InvalidState("Invalid mount point path".to_string()))?;
 
-        // Try fusermount first (Linux)
-        let mut unmount_cmd = if force {
-            let mut cmd = Command::new("fusermount");
-            cmd.args(["-u", "-z", mount_point_str]);
-            cmd
-        } else {
-            let mut cmd = Command::new("fusermount");
-            cmd.args(["-u", mount_point_str]);
-            cmd
-        };
+        // Strategy 1: Try graceful unmount first with retry
+        if !force {
+            if let Ok(()) = self.try_graceful_unmount_with_retry(mount_point_str, 3) {
+                info!("Successfully unmounted {} gracefully", mount_point.display());
+                return Ok(());
+            }
+        }
 
-        match unmount_cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Successfully unmounted {}", mount_point.display());
-                    return Ok(());
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("fusermount failed: {}", stderr);
-                }
+        // Strategy 2: Handle busy mount point
+        if self.is_mount_busy(mount_point_str) {
+            info!("Mount point is busy, attempting recovery strategies...");
+            
+            // Show what's using the mount point
+            self.show_mount_usage(mount_point_str);
+            
+            // Try to kill processes using the mount point
+            if force {
+                self.kill_mount_users(mount_point_str)?;
+                // Give processes time to exit
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            Err(e) => {
-                warn!("Failed to run fusermount: {}", e);
+        }
+
+        // Strategy 3: Try force unmount
+        if let Ok(()) = self.try_force_unmount(mount_point_str, force) {
+            info!("Successfully force unmounted {}", mount_point.display());
+            return Ok(());
+        }
+
+        // Strategy 4: Last resort - lazy unmount
+        if force {
+            if let Ok(()) = self.try_lazy_unmount(mount_point_str) {
+                warn!("Used lazy unmount for {} - mount point will be cleaned up when no longer in use", mount_point.display());
+                return Ok(());
             }
+        }
+
+        Err(Error::Fuse(format!(
+            "Failed to unmount {} - mount point is busy. Try:\n\
+            1. Close any file managers or terminals in the mount directory\n\
+            2. Run 'lsof +D {}' to see what's using the mount\n\
+            3. Use 'rss-fuse unmount --force {}' to force unmount",
+            mount_point.display(),
+            mount_point_str,
+            mount_point_str
+        )))
+    }
+
+    /// Try graceful unmount with retry mechanism
+    fn try_graceful_unmount_with_retry(&self, mount_point_str: &str, max_attempts: u32) -> Result<()> {
+        for attempt in 1..=max_attempts {
+            debug!("Attempting graceful unmount of {} (attempt {}/{})", mount_point_str, attempt, max_attempts);
+            
+            if let Ok(()) = self.try_graceful_unmount(mount_point_str) {
+                return Ok(());
+            }
+            
+            if attempt < max_attempts {
+                info!("Unmount attempt {} failed, retrying in 1 second...", attempt);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        
+        Err(Error::Fuse(format!("Failed to unmount {} after {} attempts", mount_point_str, max_attempts)))
+    }
+
+    /// Try graceful unmount
+    fn try_graceful_unmount(&self, mount_point_str: &str) -> Result<()> {
+        debug!("Attempting graceful unmount of {}", mount_point_str);
+        
+        // Try fusermount first (Linux)
+        let output = Command::new("fusermount")
+            .args(["-u", mount_point_str])
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run fusermount: {}", e)))?;
+
+        if output.status.success() {
+            return Ok(());
         }
 
         // Try umount as fallback (macOS/BSD)
-        let mut umount_cmd = if force {
-            let mut cmd = Command::new("umount");
-            cmd.args(["-f", mount_point_str]);
-            cmd
-        } else {
-            let mut cmd = Command::new("umount");
-            cmd.arg(mount_point_str);
-            cmd
-        };
+        let output = Command::new("umount")
+            .arg(mount_point_str)
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run umount: {}", e)))?;
 
-        match umount_cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Successfully unmounted {}", mount_point.display());
-                    Ok(())
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(Error::Fuse(format!("Failed to unmount: {}", stderr)))
-                }
-            }
-            Err(e) => {
-                Err(Error::Fuse(format!("Failed to run umount: {}", e)))
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(Error::Fuse(format!("Graceful unmount failed: {}", stderr)))
+        }
+    }
+
+    /// Try force unmount
+    fn try_force_unmount(&self, mount_point_str: &str, _force: bool) -> Result<()> {
+        debug!("Attempting force unmount of {}", mount_point_str);
+        
+        // Try fusermount with force flags (Linux)
+        let output = Command::new("fusermount")
+            .args(["-u", "-z", mount_point_str])
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run fusermount: {}", e)))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // Try umount with force flag (macOS/BSD)
+        let output = Command::new("umount")
+            .args(["-f", mount_point_str])
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run umount: {}", e)))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(Error::Fuse(format!("Force unmount failed: {}", stderr)))
+        }
+    }
+
+    /// Try lazy unmount (detach immediately, cleanup when no longer in use)
+    fn try_lazy_unmount(&self, mount_point_str: &str) -> Result<()> {
+        debug!("Attempting lazy unmount of {}", mount_point_str);
+        
+        // Linux: fusermount with -z (lazy) flag
+        let output = Command::new("fusermount")
+            .args(["-u", "-z", mount_point_str])
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run fusermount: {}", e)))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // Linux: umount with -l (lazy) flag
+        let output = Command::new("umount")
+            .args(["-l", mount_point_str])
+            .output()
+            .map_err(|e| Error::Fuse(format!("Failed to run umount: {}", e)))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(Error::Fuse(format!("Lazy unmount failed: {}", stderr)))
+        }
+    }
+
+    /// Check if mount point is busy
+    fn is_mount_busy(&self, mount_point_str: &str) -> bool {
+        // Check with lsof if available
+        if let Ok(output) = Command::new("lsof")
+            .args(["+D", mount_point_str])
+            .output() {
+            !output.stdout.is_empty()
+        } else {
+            // Fallback: check with fuser if available
+            if let Ok(output) = Command::new("fuser")
+                .args(["-m", mount_point_str])
+                .output() {
+                !output.stdout.is_empty()
+            } else {
+                false
             }
         }
+    }
+
+    /// Show what processes are using the mount point
+    fn show_mount_usage(&self, mount_point_str: &str) {
+        info!("Checking what's using mount point: {}", mount_point_str);
+        
+        // Try lsof first
+        if let Ok(output) = Command::new("lsof")
+            .args(["+D", mount_point_str])
+            .output() {
+            if !output.stdout.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                info!("Processes using mount point:\n{}", stdout);
+                return;
+            }
+        }
+
+        // Try fuser as fallback
+        if let Ok(output) = Command::new("fuser")
+            .args(["-v", mount_point_str])
+            .output() {
+            if !output.stdout.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                info!("Processes using mount point:\n{}", stdout);
+            }
+        }
+    }
+
+    /// Kill processes using the mount point (only when force flag is used)
+    fn kill_mount_users(&self, mount_point_str: &str) -> Result<()> {
+        warn!("Force flag enabled - attempting to kill processes using mount point");
+        
+        // Try fuser -k (kill processes)
+        if let Ok(output) = Command::new("fuser")
+            .args(["-k", "-m", mount_point_str])
+            .output() {
+            if output.status.success() {
+                info!("Killed processes using mount point");
+                return Ok(());
+            }
+        }
+
+        // Manual approach with lsof + kill
+        if let Ok(output) = Command::new("lsof")
+            .args(["-t", "+D", mount_point_str])
+            .output() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    warn!("Killing process {} using mount point", pid);
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .output();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a mount point is stale (appears mounted but not responsive)
+    pub fn is_mount_stale(&self, mount_point: &Path) -> bool {
+        if !self.is_mounted(mount_point) {
+            return false;
+        }
+        
+        // Try to access the mount point to see if it's responsive
+        match std::fs::read_dir(mount_point) {
+            Ok(_) => false, // Mount is responsive
+            Err(e) => {
+                // Check for common stale mount errors
+                let error_msg = e.to_string().to_lowercase();
+                error_msg.contains("transport endpoint is not connected") ||
+                error_msg.contains("stale file handle") ||
+                error_msg.contains("input/output error")
+            }
+        }
+    }
+    
+    /// Cleanup a stale mount point
+    pub fn cleanup_stale_mount(&self, mount_point: &Path) -> Result<()> {
+        info!("Attempting to cleanup stale mount: {}", mount_point.display());
+        
+        let mount_point_str = mount_point.to_str()
+            .ok_or_else(|| Error::InvalidState("Invalid mount point path".to_string()))?;
+        
+        // Try lazy unmount first (safest for stale mounts)
+        if let Ok(()) = self.try_lazy_unmount(mount_point_str) {
+            info!("Successfully cleaned up stale mount with lazy unmount");
+            return Ok(());
+        }
+        
+        // Try force unmount
+        if let Ok(()) = self.try_force_unmount(mount_point_str, true) {
+            info!("Successfully cleaned up stale mount with force unmount");
+            return Ok(());
+        }
+        
+        Err(Error::Fuse(format!("Failed to cleanup stale mount: {}", mount_point.display())))
     }
 
     /// Check if a path is currently mounted

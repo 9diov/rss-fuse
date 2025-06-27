@@ -89,7 +89,7 @@ impl RegexPatterns {
         Ok(Self {
             code_block: Regex::new(r"```[\s\S]*?```").map_err(|e| Error::ContentExtraction(e.to_string()))?,
             inline_code: Regex::new(r"`[^`]+`").map_err(|e| Error::ContentExtraction(e.to_string()))?,
-            whitespace: Regex::new(r"\s+").map_err(|e| Error::ContentExtraction(e.to_string()))?,
+            whitespace: Regex::new(r"[ \t]+").map_err(|e| Error::ContentExtraction(e.to_string()))?,
             multiple_newlines: Regex::new(r"\n{3,}").map_err(|e| Error::ContentExtraction(e.to_string()))?,
         })
     }

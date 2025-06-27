@@ -51,6 +51,14 @@ pub enum Commands {
         /// Foreground mode (do not daemonize)
         #[arg(short, long)]
         foreground: bool,
+        
+        /// Disable automatic file manager launch
+        #[arg(long)]
+        no_auto_open: bool,
+        
+        /// Override file manager command
+        #[arg(long)]
+        file_manager: Option<String>,
     },
     
     /// Unmount the filesystem
@@ -88,7 +96,11 @@ pub enum Commands {
     },
     
     /// Show RSS-FUSE status
-    Status,
+    Status {
+        /// Check mount status for specific path
+        #[arg(short, long)]
+        mount_point: Option<PathBuf>,
+    },
     
     /// Generate shell completions
     Completions {
@@ -114,8 +126,8 @@ impl Cli {
             Commands::Init { mount_point } => {
                 commands::init(mount_point).await
             }
-            Commands::Mount { mount_point, daemon, allow_other, foreground } => {
-                mount::mount(mount_point, daemon, allow_other, foreground, self.config).await
+            Commands::Mount { mount_point, daemon, allow_other, foreground, no_auto_open, file_manager } => {
+                mount::mount(mount_point, daemon, allow_other, foreground, no_auto_open, file_manager, self.config).await
             }
             Commands::Unmount { mount_point, force } => {
                 mount::unmount(mount_point, force).await
@@ -132,8 +144,8 @@ impl Cli {
             Commands::Refresh { feed } => {
                 commands::refresh(feed, self.config).await
             }
-            Commands::Status => {
-                commands::status().await
+            Commands::Status { mount_point } => {
+                commands::status(mount_point).await
             }
             Commands::Completions { shell } => {
                 commands::generate_completions(shell);

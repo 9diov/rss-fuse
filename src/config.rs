@@ -61,6 +61,54 @@ pub struct FilesystemConfig {
     
     #[serde(default = "default_auto_unmount")]
     pub auto_unmount: bool,
+    
+    #[serde(default)]
+    pub auto_open: FileManagerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileManagerConfig {
+    /// Enable automatic file manager launch after mounting
+    #[serde(default)]
+    pub enabled: bool,
+    
+    /// File manager command to launch (e.g., "ranger", "yazi", "lf", "nnn")
+    #[serde(default = "default_file_manager")]
+    pub command: String,
+    
+    /// Additional arguments to pass to the file manager
+    #[serde(default)]
+    pub args: Vec<String>,
+    
+    /// Launch in a new terminal (requires terminal command)
+    #[serde(default)]
+    pub new_terminal: bool,
+    
+    /// Terminal command to use when new_terminal is true
+    #[serde(default = "default_terminal_command")]
+    pub terminal_command: String,
+    
+    /// Delay in seconds before launching file manager (allows mount to stabilize)
+    #[serde(default = "default_launch_delay")]
+    pub launch_delay: u64,
+    
+    /// Auto-detect available file managers and use the first found
+    #[serde(default = "default_auto_detect")]
+    pub auto_detect: bool,
+}
+
+impl Default for FileManagerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: default_file_manager(),
+            args: Vec::new(),
+            new_terminal: false,
+            terminal_command: default_terminal_command(),
+            launch_delay: default_launch_delay(),
+            auto_detect: default_auto_detect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +254,7 @@ impl Default for FilesystemConfig {
             dir_permissions: default_dir_permissions(),
             allow_other: false,
             auto_unmount: default_auto_unmount(),
+            auto_open: FileManagerConfig::default(),
         }
     }
 }
@@ -254,3 +303,9 @@ fn default_log_level() -> String { "info".to_string() }
 fn default_max_size_mb() -> usize { 100 }
 fn default_cleanup_interval() -> u64 { 300 }
 fn default_log_file() -> String { "logs/rss-fuse.log".to_string() }
+
+// File manager defaults
+fn default_file_manager() -> String { "ranger".to_string() }
+fn default_terminal_command() -> String { "xterm".to_string() }
+fn default_launch_delay() -> u64 { 2 }
+fn default_auto_detect() -> bool { true }

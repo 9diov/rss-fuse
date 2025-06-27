@@ -287,7 +287,7 @@ pub async fn refresh(feed_name: Option<String>, config_path: Option<PathBuf>) ->
 }
 
 /// Show RSS-FUSE status
-pub async fn status() -> Result<()> {
+pub async fn status(specific_mount_point: Option<PathBuf>) -> Result<()> {
     info!("Showing status");
     
     println!("📊 RSS-FUSE Status");
@@ -332,10 +332,118 @@ pub async fn status() -> Result<()> {
         println!("❌ Logs directory: Not found");
     }
     
+    // Check mount status
+    println!("\n🗂️  Mount Status:");
+    let fuse_ops = crate::fuse::FuseOperations::new();
+    
+    if let Some(specific_path) = specific_mount_point {
+        // Check specific mount point
+        println!("Checking specific mount point: {}", specific_path.display());
+        
+        if specific_path.exists() {
+            if fuse_ops.is_mounted(&specific_path) {
+                if fuse_ops.is_mount_stale(&specific_path) {
+                    println!("⚠️  Status: STALE MOUNT");
+                    println!("   The mount point appears to be mounted but is not responsive");
+                    println!("   This usually indicates a crashed or hung FUSE process");
+                    println!("   Action: rss-fuse unmount --force {}", specific_path.display());
+                } else {
+                    println!("✅ Status: ACTIVE MOUNT");
+                    println!("   The filesystem is mounted and responsive");
+                    let stats = fuse_ops.get_stats();
+                    println!("   📁 Total inodes: {}", stats.total_inodes);
+                    println!("   📰 Feeds mounted: {}", stats.feeds_count);
+                    println!("   Action: Access files at {}", specific_path.display());
+                }
+            } else {
+                println!("❌ Status: NOT MOUNTED");
+                println!("   Directory exists but no filesystem is mounted");
+                println!("   Action: rss-fuse mount {}", specific_path.display());
+            }
+        } else {
+            println!("❌ Status: DIRECTORY MISSING");
+            println!("   Mount point directory doesn't exist");
+            println!("   Action: rss-fuse init {}", specific_path.display());
+        }
+    } else {
+        // Scan for common mount points
+        let common_mount_points = [
+            "/tmp/rss-fuse",
+            "/tmp/rss-mount", 
+            &format!("{}/rss-mount", std::env::var("HOME").unwrap_or_default()),
+            &format!("{}/rss-fuse", std::env::var("HOME").unwrap_or_default()),
+        ];
+        
+        let mut active_mounts = Vec::new();
+        let mut stale_mounts = Vec::new();
+        
+        for mount_point_str in &common_mount_points {
+            let mount_point = std::path::PathBuf::from(mount_point_str);
+            if mount_point.exists() && fuse_ops.is_mounted(&mount_point) {
+                if fuse_ops.is_mount_stale(&mount_point) {
+                    stale_mounts.push(mount_point);
+                } else {
+                    active_mounts.push(mount_point);
+                }
+            }
+        }
+        
+        if !active_mounts.is_empty() {
+            for mount_point in &active_mounts {
+                println!("✅ Mount point: {} (ACTIVE)", mount_point.display());
+                println!("   Status: Mounted and responsive");
+                
+                // Show filesystem stats if available
+                let stats = fuse_ops.get_stats();
+                println!("   📁 Total inodes: {}", stats.total_inodes);
+                println!("   📰 Feeds mounted: {}", stats.feeds_count);
+            }
+        }
+        
+        if !stale_mounts.is_empty() {
+            for mount_point in &stale_mounts {
+                println!("⚠️  Mount point: {} (STALE)", mount_point.display());
+                println!("   Status: Mounted but not responsive");
+                println!("   Action: Run 'rss-fuse unmount --force {}' to cleanup", mount_point.display());
+            }
+        }
+        
+        if active_mounts.is_empty() && stale_mounts.is_empty() {
+            println!("❌ Mount point: No active RSS-FUSE mounts found");
+            println!("   Status: No mounted filesystems detected");
+            if config_file.exists() {
+                println!("   Action: Run 'rss-fuse mount <mount-point>' to mount");
+            } else {
+                println!("   Action: Run 'rss-fuse init <mount-point>' first, then mount");
+            }
+            
+            println!("\n💡 Tip: Use 'rss-fuse status --mount-point <path>' to check a specific location");
+        }
+    }
+    
     // System information
     println!("\n🖥️  System Information:");
     println!("   📍 Config directory: {}", config_dir.display());
     println!("   🔧 Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("   🐧 Platform: {}", std::env::consts::OS);
+    
+    // Check for required tools
+    println!("\n🛠️  System Tools:");
+    let tools = [
+        ("fusermount", "FUSE unmounting"),
+        ("umount", "Fallback unmounting"),
+        ("lsof", "Process detection"),
+        ("fuser", "Process management"),
+    ];
+    
+    for (tool, description) in &tools {
+        if std::process::Command::new(tool).arg("--help").output().is_ok() ||
+           std::process::Command::new(tool).arg("-h").output().is_ok() {
+            println!("   ✅ {}: Available ({})", tool, description);
+        } else {
+            println!("   ❌ {}: Not found ({})", tool, description);
+        }
+    }
     
     Ok(())
 }
@@ -533,6 +641,29 @@ auto_unmount = true
 
 # Read-only filesystem
 read_only = true
+
+# File manager auto-open configuration
+[fuse.auto_open]
+# Enable automatic file manager launch after mounting
+enabled = false
+
+# File manager command (auto-detected if auto_detect = true)
+command = "ranger"
+
+# Additional arguments to pass to the file manager
+args = []
+
+# Launch in a new terminal window
+new_terminal = true
+
+# Terminal command to use (auto-detected if using default)
+terminal_command = "xterm"
+
+# Delay in seconds before launching (allows mount to stabilize)
+launch_delay = 2
+
+# Auto-detect available file managers
+auto_detect = true
 
 [feeds]
 # Add your RSS feeds here

@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
+use chrono::{DateTime, Utc};
 
 use fuser::{
     Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
@@ -11,16 +12,25 @@ use libc::{ENOENT, ENOTDIR, EISDIR, EINVAL};
 use parking_lot::RwLock;
 use tracing::{debug, warn, error};
 
-use crate::fuse::{create_file_attr, TTL};
+use crate::fuse::create_file_attr;
 use crate::fuse::inode::{InodeManager, NodeType};
 use crate::feed::{Feed, Article};
 use crate::error::Result;
+
+/// Feed loading status
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedLoadingStatus {
+    Loading,
+    Loaded,
+    Error(String),
+}
 
 /// Main FUSE filesystem implementation for RSS-FUSE
 pub struct RssFuseFilesystem {
     inode_manager: Arc<InodeManager>,
     feeds: RwLock<HashMap<String, Feed>>,
     config_content: RwLock<String>,
+    loading_status: RwLock<HashMap<String, FeedLoadingStatus>>,
 }
 
 impl Clone for RssFuseFilesystem {
@@ -29,6 +39,7 @@ impl Clone for RssFuseFilesystem {
             inode_manager: Arc::clone(&self.inode_manager),
             feeds: RwLock::new(self.feeds.read().clone()),
             config_content: RwLock::new(self.config_content.read().clone()),
+            loading_status: RwLock::new(self.loading_status.read().clone()),
         }
     }
 }
@@ -46,11 +57,131 @@ impl RssFuseFilesystem {
             inode_manager,
             feeds: RwLock::new(HashMap::new()),
             config_content: RwLock::new(String::new()),
+            loading_status: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Add a loading placeholder directory for a feed
+    pub fn add_loading_placeholder(&self, feed_name: &str) -> Result<()> {
+        // Update loading status
+        self.loading_status.write().insert(feed_name.to_string(), FeedLoadingStatus::Loading);
+        
+        // Create feed directory
+        if let Err(e) = self.inode_manager.create_feed_directory(feed_name) {
+            warn!("Failed to create feed directory for {}: {}", feed_name, e);
+            return Err(crate::error::Error::Fuse(e.to_string()));
+        }
+
+        // Add a loading placeholder file
+        let loading_content = format!(
+            "📡 Loading feed: {}\n\
+            ⏳ Please wait while we fetch the latest articles...\n\
+            🔄 This file will be replaced with actual articles once loading completes.\n\
+            \n\
+            Status: Fetching RSS feed\n\
+            Started: {}\n\
+            \n\
+            If this takes too long, check:\n\
+            • Your internet connection\n\
+            • The feed URL is correct\n\
+            • The RSS server is responding\n",
+            feed_name,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        );
+
+        // Create a placeholder article
+        let placeholder_article = Arc::new(Article {
+            id: format!("loading-{}", feed_name),
+            title: format!("⏳ Loading {}...", feed_name),
+            link: "".to_string(),
+            description: Some("Feed is currently loading. Please wait...".to_string()),
+            content: Some(loading_content),
+            author: Some("RSS-FUSE".to_string()),
+            published: Some(chrono::Utc::now()),
+            updated: None,
+            tags: vec!["loading".to_string()],
+            read: false,
+            cached_at: Some(chrono::Utc::now()),
+        });
+
+        if let Err(e) = self.inode_manager.create_article_file(feed_name, placeholder_article) {
+            warn!("Failed to create loading placeholder for {}: {}", feed_name, e);
+        }
+
+        Ok(())
+    }
+
+    /// Add an error placeholder when feed loading fails
+    pub fn add_error_placeholder(&self, feed_name: &str, error_message: &str) -> Result<()> {
+        // Update loading status
+        self.loading_status.write().insert(feed_name.to_string(), FeedLoadingStatus::Error(error_message.to_string()));
+        
+        // Remove existing content
+        self.remove_feed(feed_name)?;
+        
+        // Create feed directory
+        if let Err(e) = self.inode_manager.create_feed_directory(feed_name) {
+            warn!("Failed to create feed directory for {}: {}", feed_name, e);
+            return Err(crate::error::Error::Fuse(e.to_string()));
+        }
+
+        // Add an error placeholder file
+        let error_content = format!(
+            "❌ Failed to load feed: {}\n\
+            \n\
+            Error: {}\n\
+            \n\
+            ⏰ Last attempt: {}\n\
+            \n\
+            📋 Troubleshooting:\n\
+            • Check your internet connection\n\
+            • Verify the feed URL is correct\n\
+            • Ensure the RSS server is accessible\n\
+            • Check RSS-FUSE logs for detailed error information\n\
+            \n\
+            🔄 The feed will be retried automatically on the next refresh cycle.\n\
+            \n\
+            💡 You can also try:\n\
+            • rss-fuse refresh {}\n\
+            • rss-fuse remove-feed {} && rss-fuse add-feed {} <new-url>\n",
+            feed_name,
+            error_message,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            feed_name,
+            feed_name,
+            feed_name
+        );
+
+        // Create an error article
+        let error_article = Arc::new(Article {
+            id: format!("error-{}", feed_name),
+            title: format!("❌ Error loading {}", feed_name),
+            link: "".to_string(),
+            description: Some("Feed failed to load. See details inside.".to_string()),
+            content: Some(error_content),
+            author: Some("RSS-FUSE".to_string()),
+            published: Some(chrono::Utc::now()),
+            updated: None,
+            tags: vec!["error".to_string()],
+            read: false,
+            cached_at: Some(chrono::Utc::now()),
+        });
+
+        if let Err(e) = self.inode_manager.create_article_file(feed_name, error_article) {
+            warn!("Failed to create error placeholder for {}: {}", feed_name, e);
+        }
+
+        Ok(())
     }
 
     pub fn add_feed(&self, feed: Feed) -> Result<()> {
         let feed_name = feed.name.clone();
+        
+        // Update loading status
+        self.loading_status.write().insert(feed_name.clone(), FeedLoadingStatus::Loaded);
+        
+        // Remove existing content (including placeholders)
+        self.remove_feed(&feed_name)?;
         
         // Create feed directory
         if let Err(e) = self.inode_manager.create_feed_directory(&feed_name) {
@@ -118,6 +249,35 @@ impl RssFuseFilesystem {
         self.inode_manager.get_node_by_name(parent_ino, name)
     }
 
+    pub fn get_loading_status(&self, feed_name: &str) -> Option<FeedLoadingStatus> {
+        self.loading_status.read().get(feed_name).cloned()
+    }
+
+    /// Get TTL based on content state - dynamic content gets shorter cache times
+    pub fn get_ttl_for_node(&self, node: &crate::fuse::inode::VNode) -> Duration {
+        use std::time::Duration;
+        
+        match &node.node_type {
+            crate::fuse::inode::NodeType::FeedDirectory(feed_name) => {
+                match self.loading_status.read().get(feed_name) {
+                    Some(FeedLoadingStatus::Loading) => Duration::from_secs(0), // No cache while loading
+                    Some(FeedLoadingStatus::Error(_)) => Duration::from_secs(2), // Short cache for errors
+                    Some(FeedLoadingStatus::Loaded) => Duration::from_secs(30), // Longer cache for stable content
+                    None => Duration::from_secs(1), // Default for unconfigured feeds
+                }
+            },
+            crate::fuse::inode::NodeType::ArticleFile(feed_name, _) => {
+                match self.loading_status.read().get(feed_name) {
+                    Some(FeedLoadingStatus::Loading) => Duration::from_secs(0), // No cache while loading
+                    Some(FeedLoadingStatus::Error(_)) => Duration::from_secs(2), // Short cache for errors  
+                    Some(FeedLoadingStatus::Loaded) => Duration::from_secs(60), // Long cache for stable articles
+                    None => Duration::from_secs(1), // Default
+                }
+            },
+            _ => Duration::from_secs(10), // Longer cache for static content (meta files, etc.)
+        }
+    }
+
     pub fn update_config(&self, content: String) {
         let content_len = content.len() as u64;
         *self.config_content.write() = content;
@@ -153,7 +313,8 @@ impl Filesystem for RssFuseFilesystem {
         match self.lookup_node(parent, name) {
             Some(node) => {
                 let attr = self.node_to_file_attr(&node);
-                reply.entry(&TTL, &attr, 0);
+                let ttl = self.get_ttl_for_node(&node);
+                reply.entry(&ttl, &attr, 0);
             }
             None => {
                 debug!("lookup: not found");
@@ -168,7 +329,8 @@ impl Filesystem for RssFuseFilesystem {
         match self.inode_manager.get_node(ino) {
             Some(node) => {
                 let attr = self.node_to_file_attr(&node);
-                reply.attr(&TTL, &attr);
+                let ttl = self.get_ttl_for_node(&node);
+                reply.attr(&ttl, &attr);
             }
             None => {
                 debug!("getattr: inode {} not found", ino);

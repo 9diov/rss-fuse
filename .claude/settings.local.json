@@ -9,7 +9,15 @@
       "Bash(cargo:*)",
       "Bash(./target/debug/rss-fuse --help)",
       "Bash(./target/debug/rss-fuse:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(timeout:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:libfuse.github.io)",
+      "Bash(pkill:*)",
+      "Bash(fusermount:*)",
+      "Bash(true)"
     ],
     "deny": []
   }
